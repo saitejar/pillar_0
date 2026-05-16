@@ -1,0 +1,16 @@
+[submodule "rate-evals"]
+	path = rate-evals
+	url = https://github.com/YalaLab/rate-evals.git
+[submodule "rate"]
+	path = rate
+	url = https://github.com/YalaLab/rate.git
+[submodule "rave"]
+	path = rave
+	url = https://github.com/YalaLab/rave.git
+[submodule "pillar-pretrain"]
+	path = pillar-pretrain
+	url = https://github.com/YalaLab/pillar-pretrain.git
+[submodule "pillar-finetune"]
+	path = pillar-finetune
+	url = https://github.com/YalaLab/pillar-finetune.git
+

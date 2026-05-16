@@ -1,0 +1,31 @@
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+.env
+xcuserdata/
+*.xcuserstate
+
+# Generated data/model artifacts. These are too large for normal GitHub pushes
+# and some artifacts come from gated model/data access.
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/pillar0_headct_coreml/
+artifacts/pillar0_headct_coreml/*
+!artifacts/pillar0_headct_coreml/.gitkeep
+
+benchmarks/
+data/
+
+# iOS build products and bundled generated resources.
+ios/test_pillar_0/build/
+ios/test_pillar_0/DerivedData/
+.build/
+ios/test_pillar_0/test_pillar_0/Pillar0Resources/*
+!ios/test_pillar_0/test_pillar_0/Pillar0Resources/.gitkeep
+
+*.mlpackage/
+*.mlmodelc/
+*.pt
+*.npy
+*.raw

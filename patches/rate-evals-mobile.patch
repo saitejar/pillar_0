@@ -1,0 +1,303 @@
+diff --git a/configs/config.yaml b/configs/config.yaml
+index 48572c5..9fbfdda 100644
+--- a/configs/config.yaml
++++ b/configs/config.yaml
+@@ -35,7 +35,7 @@ datasets:
+ 
+ # Hardware settings (can override base config)
+ hardware:
+-  device: cuda
++  device: auto
+   batch_size_per_gpu: 16
+   num_workers_per_gpu: 8
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 50d7781..af612fa 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,7 +10,7 @@ authors = [
+ ]
+ description = "A comprehensive evaluation pipeline for Vision-Language Models on medical imaging tasks"
+ readme = "README.md"
+-requires-python = ">=3.8"
++requires-python = ">=3.8,<3.12"
+ license = {text = "MIT"}
+ keywords = ["medical-imaging", "vision-language-models", "evaluation", "deep-learning", "radiology"]
+ classifiers = [
+@@ -52,7 +52,6 @@ dependencies = [
+     "nvitop>=1.5.1",
+     "hf-transfer>=0.1.9",
+     "nibabel>=5.2.1",
+-    "flash-attn>=2.7.0.post2",
+     "pip>=25.0.1",
+     "ipdb>=0.13.13",
+     "jupyterlab>=4.3.8",
+@@ -110,9 +109,6 @@ addopts = "-v --tb=short"
+ [tool.uv.sources]
+ rad-vision-engine = { git = "https://github.com/YalaLab/rave", branch = "main" }
+ 
+-[tool.uv.extra-build-dependencies]
+-flash-attn = ["torch"]
+-
+ [tool.ruff]
+ line-length = 100
+ target-version = "py38"
+diff --git a/rate_eval/cli/extract.py b/rate_eval/cli/extract.py
+index 933c40a..1f44cfe 100644
+--- a/rate_eval/cli/extract.py
++++ b/rate_eval/cli/extract.py
+@@ -37,7 +37,7 @@ def suppress_cuda_warnings():
+ 
+ 
+ from .. import setup_pipeline, create_model, create_dataset
+-from ..common import get_logger, SimpleCheckpointManager, SimpleResumableDataset
++from ..common import get_logger, setup_device, SimpleCheckpointManager, SimpleResumableDataset
+ 
+ logger = get_logger(__name__)
+ 
+@@ -72,28 +72,30 @@ def extract_embeddings_single_gpu(
+             log_level = "DEBUG" if args.debug else "INFO"
+             setup_logging(level=log_level, rank=rank, world_size=world_size, debug=args.debug)
+ 
+-        # Set GPU device for multi-GPU, or use specified device for single GPU
++        # Set CUDA device for multi-GPU, or resolve a single accelerator/CPU.
+         if world_size > 1:
+             device = f"cuda:{rank}"
+             torch.cuda.set_device(rank)
+         else:
+-            device = args.device or getattr(getattr(config, "hardware", None), "device", "cuda:0")
++            device_spec = args.device or getattr(getattr(config, "hardware", None), "device", None)
++            device = setup_device(device_spec)
+ 
+         # Update config for this GPU
+         from omegaconf import OmegaConf
+ 
+         local_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+-        OmegaConf.update(local_config, "hardware.device", device)
++        OmegaConf.update(local_config, "hardware.device", str(device))
+ 
+-        logger.info(f"GPU {rank}: Loading model {args.model} on {device}")
+-        logger.debug(f"GPU {rank}: Model config for {args.model}: device={device}")
++        worker_label = f"GPU {rank}" if world_size > 1 else str(device).upper()
++        logger.info(f"{worker_label}: Loading model {args.model} on {device}")
++        logger.debug(f"{worker_label}: Model config for {args.model}: device={device}")
+ 
+         # Setup model
+         model_load_start = time.time()
+         model = create_model(args.model, local_config)
+         model_load_time = time.time() - model_load_start
+-        print(f"[TIMING] GPU {rank}: Model loading took {model_load_time:.2f}s")
+-        logger.debug(f"GPU {rank}: Model {args.model} loaded successfully")
++        print(f"[TIMING] {worker_label}: Model loading took {model_load_time:.2f}s")
++        logger.debug(f"{worker_label}: Model {args.model} loaded successfully")
+ 
+         # Setup dataset - use resumable dataset if checkpoint manager provided
+         # Create a picklable preprocessor if the model supports it
+@@ -184,7 +186,11 @@ def extract_embeddings_single_gpu(
+         num_workers = min(getattr(getattr(config, "hardware", None), "num_workers_per_gpu", 4), 8)
+ 
+         data_loader = DataLoader(
+-            subset, batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=True
++            subset,
++            batch_size=batch_size,
++            num_workers=num_workers,
++            shuffle=False,
++            pin_memory=torch.device(device).type == "cuda",
+         )
+ 
+         # Extract embeddings with checkpoint saving
+@@ -498,6 +504,8 @@ def extract_embeddings_single_gpu(
+         import traceback
+ 
+         traceback.print_exc()
++        if not args.continue_on_error:
++            raise
+         return np.array([]), []
+ 
+ 
+@@ -510,18 +518,29 @@ def _worker_process(rank, num_gpus, args, config, dataset_size, checkpoint_manag
+ 
+ 
+ def extract_embeddings(args, config, checkpoint_manager=None):
+-    """Extract embeddings using available GPUs with checkpoint support."""
+-    # Get available GPUs (inline the simple function)
+-    if torch.cuda.is_available():
++    """Extract embeddings using available accelerators with checkpoint support."""
++    requested_device = args.device or getattr(getattr(config, "hardware", None), "device", None)
++    requested_device_name = str(requested_device).lower() if requested_device is not None else None
++    wants_cuda = requested_device_name in {None, "", "auto"} or requested_device_name.startswith(
++        "cuda"
++    )
++
++    # Multi-device extraction is CUDA-only. MPS/Metal runs as a single accelerator.
++    if wants_cuda and torch.cuda.is_available():
+         available_gpus = list(range(torch.cuda.device_count()))
+     else:
+         available_gpus = []
+ 
+     # Determine number of GPUs to use
+     if not available_gpus:
+-        logger.warning("No GPUs available, using CPU")
++        single_device = setup_device(requested_device)
++        if args.num_gpus and args.num_gpus > 1:
++            logger.warning(
++                "--num-gpus is only supported for CUDA extraction; using single device %s",
++                single_device,
++            )
+         num_gpus = 1
+-        gpu_ids = ["cpu"]
++        gpu_ids = [str(single_device)]
+     else:
+         if args.num_gpus:
+             num_gpus = min(args.num_gpus, len(available_gpus))
+@@ -529,7 +548,8 @@ def extract_embeddings(args, config, checkpoint_manager=None):
+             num_gpus = len(available_gpus)
+         gpu_ids = available_gpus[:num_gpus]
+ 
+-    logger.info(f"Using {num_gpus} {'GPU' if num_gpus == 1 else 'GPUs'}: {gpu_ids}")
++    device_label = "CUDA GPU" if available_gpus else "device"
++    logger.info(f"Using {num_gpus} {device_label if num_gpus == 1 else device_label + 's'}: {gpu_ids}")
+ 
+     # Load dataset to get size (without loading data)
+     # Note: We don't pass model_preprocess here since this is just for getting size
+@@ -837,7 +857,9 @@ def extract_embeddings_cli():
+             )
+         except Exception as e:
+             logger.error(f"Failed to extract embeddings for split {split}: {e}")
+-            continue
++            if args.continue_on_error:
++                continue
++            raise
+ 
+         extraction_time = time.time() - start_time
+ 
+@@ -853,7 +875,10 @@ def extract_embeddings_cli():
+             logger.info(f"Throughput: {stats['total_processed']/extraction_time:.2f} samples/sec")
+ 
+         if stats["total_processed"] == 0:
+-            logger.error(f"No embeddings were extracted for split {split}!")
++            message = f"No embeddings were extracted for split {split}!"
++            logger.error(message)
++            if not args.continue_on_error:
++                raise RuntimeError(message)
+ 
+     logger.info(f"\n{'='*60}")
+     logger.info("All splits processing completed!")
+diff --git a/rate_eval/common.py b/rate_eval/common.py
+index 93f659f..dd943e6 100644
+--- a/rate_eval/common.py
++++ b/rate_eval/common.py
+@@ -159,24 +159,47 @@ def log_colored(logger: logging.Logger, level: str, message: str, color: str = N
+ # =============================================================================
+ 
+ 
++def _mps_is_available() -> bool:
++    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
++
++
++def get_default_device() -> torch.device:
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    if _mps_is_available():
++        return torch.device("mps")
++    return torch.device("cpu")
++
++
+ def setup_device(device_spec: Optional[str] = None) -> torch.device:
+     """
+     Set up and validate device for model/data operations.
+ 
+     Args:
+-        device_spec: Device specification ('cuda', 'cpu', 'cuda:0', etc.)
++        device_spec: Device specification ('auto', 'cuda', 'mps', 'metal', 'cpu', etc.)
+ 
+     Returns:
+         Torch device object
+     """
+-    if device_spec is None:
+-        device_spec = "cuda" if torch.cuda.is_available() else "cpu"
++    if device_spec is None or str(device_spec).lower() in {"", "auto"}:
++        return get_default_device()
++
++    device_spec = str(device_spec)
++    if device_spec.lower().startswith("metal"):
++        device_spec = "mps" + device_spec[5:]
+ 
+     device = torch.device(device_spec)
+ 
+     if device.type == "cuda" and not torch.cuda.is_available():
+         logger = get_logger(__name__)
+-        logger.warning("CUDA requested but not available, falling back to CPU")
++        fallback = get_default_device()
++        if fallback.type == "cuda":
++            fallback = torch.device("cpu")
++        logger.warning("%s requested but not available, falling back to %s", device, fallback)
++        device = fallback
++    elif device.type == "mps" and not _mps_is_available():
++        logger = get_logger(__name__)
++        logger.warning("MPS/Metal requested but not available, falling back to CPU")
+         device = torch.device("cpu")
+ 
+     return device
+diff --git a/rate_eval/evaluation.py b/rate_eval/evaluation.py
+index 5ff0e6d..50d7c48 100644
+--- a/rate_eval/evaluation.py
++++ b/rate_eval/evaluation.py
+@@ -23,7 +23,7 @@ from sklearn.metrics import (
+     confusion_matrix,
+ )
+ 
+-from .common import get_logger, ensure_dir_exists, RATEEvalError
++from .common import get_logger, ensure_dir_exists, RATEEvalError, setup_device
+ from .config import get_config_value
+ 
+ logger = get_logger(__name__)
+@@ -161,7 +161,7 @@ class PyTorchClassifierTrainer:
+ 
+     def __init__(self, config: dict):
+         self.config = config
+-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        self.device = setup_device(get_config_value(config, "hardware.device"))
+         self.check_nan = get_config_value(config, "evaluation.check_nan")
+ 
+         # Training hyperparameters
+@@ -286,7 +286,7 @@ class PyTorchClassifierTrainer:
+             batch_size=self.batch_size,
+             shuffle=True,
+             num_workers=self.num_workers,
+-            pin_memory=True,
++            pin_memory=self.device.type == "cuda",
+         )
+ 
+         # Training loop
+@@ -348,7 +348,7 @@ class PyTorchEvaluator:
+ 
+     def __init__(self, config: dict):
+         self.config = config
+-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        self.device = setup_device(get_config_value(config, "hardware.device"))
+         self.batch_size = get_config_value(config, "evaluation.pytorch.batch_size")
+         self.num_workers = int(get_config_value(config, "evaluation.pytorch.num_workers"))
+ 
+@@ -378,7 +378,7 @@ class PyTorchEvaluator:
+             batch_size=self.batch_size,
+             shuffle=False,
+             num_workers=self.num_workers,
+-            pin_memory=True,
++            pin_memory=self.device.type == "cuda",
+         )
+ 
+         all_probs = []
+diff --git a/setup.py b/setup.py
+index ead003d..57ac9d7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -19,7 +19,7 @@ setup(
+     url="https://github.com/your-org/rate_eval",
+     packages=find_packages(),
+     install_requires=requirements,
+-    python_requires=">=3.8",
++    python_requires=">=3.8,<3.12",
+     classifiers=[
+         "Development Status :: 4 - Beta",
+         "Intended Audience :: Science/Research",
