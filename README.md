@@ -15,6 +15,24 @@ input:  1 x 11 x 128 x 256 x 256 fp16 windowed HeadCT tensor
 output: 1 x 1152 Pillar-0 image embedding
 ```
 
+## Important: This Is Not A Classifier Yet
+
+This package runs the **Pillar-0 HeadCT image encoder**. Its output is an
+embedding vector, not a diagnosis, label, probability, or true/false result.
+
+```text
+what this repo currently does:
+Head CT tensor -> Pillar-0 encoder -> 1152-d embedding
+
+what a clinical app still needs:
+1152-d embedding -> trained classifier / linear probe -> probability or label
+```
+
+The current Mac and iPhone commands validate that the Core ML int8 encoder
+produces embeddings that agree with the PyTorch teacher. To get a result such
+as hemorrhage `true/false`, mass effect probability, or any RATE task score,
+you must train or attach a downstream classifier on top of these embeddings.
+
 The iOS app and Mac runner currently validate **encoder equivalence**: they
 compare the int8 Core ML embedding against the PyTorch/TorchScript teacher
 embedding with cosine similarity and absolute-difference metrics. A clinical
@@ -183,12 +201,10 @@ PILLAR0_UV_ARGS= make mac-infer
 
 ## Publishing
 
-No GitHub remote is configured in this local checkout yet. After you create a
-repo, add it and push:
+This package is intended to live at:
 
-```bash
-git remote add origin git@github.com:<owner>/<repo>.git
-git push -u origin main
+```text
+https://github.com/saitejar/pillar_0
 ```
 
 Do not push the generated artifacts directly. Use GitHub Releases, Hugging Face,
